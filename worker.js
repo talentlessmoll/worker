@@ -7,7 +7,7 @@ export default {
       const category = url.searchParams.get('category') || 'All Sports';
       const urls = {
         'All Sports': 'https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard',
-        'Football': 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard',
+        'Soccer': 'https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard',
         'Basketball': 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard',
         'Tennis': 'https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard',
         'UFC': 'https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard'
