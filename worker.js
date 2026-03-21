@@ -28,31 +28,59 @@ export default {
 
     // Handle API requests
     if (url.pathname === '/api/sports') {
-      const category = url.searchParams.get('category') || 'live';
-      const categoryMap = {
-        'All Sports': 'live',
-        'Soccer': 'football',
-        'Basketball': 'basketball',
-        'Tennis': 'tennis',
-        'UFC': 'mma'
-      };
-      
-      const targetCategory = categoryMap[category] || 'live';
-      const targetUrl = `https://streamed.pk/api/matches/${targetCategory}`;
+      const category = url.searchParams.get('category');
       
       try {
-        const response = await fetch(targetUrl);
-        const data = await response.json();
+        if (!category || category === 'All Sports') {
+          const response = await fetch('https://streamed.pk/api/matches/all');
+          const data = await response.json();
+          return new Response(JSON.stringify(data), {
+            headers: { 'content-type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+          });
+        } else {
+          // Fetch the list of sports to get the ID
+          const sportsResponse = await fetch('https://streamed.pk/api/sports');
+          const sports = await sportsResponse.json();
+          
+          // Handle 'Soccer' mapping to 'football'
+          let sportName = category;
+          if (category === 'Soccer') sportName = 'Football';
+          
+          const sport = sports.find((s: any) => s.name.toLowerCase() === sportName.toLowerCase());
+          
+          if (!sport) {
+            return new Response(JSON.stringify({ error: "Sport not found" }), { status: 404 });
+          }
+
+          const matchesResponse = await fetch(`https://streamed.pk/api/matches/${sport.id}`);
+          const data = await matchesResponse.json();
+          return new Response(JSON.stringify(data), {
+            headers: { 'content-type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+          });
+        }
+      } catch (error) {
+        console.error('API fetch failed:', error);
+        return new Response(JSON.stringify({ error: "Failed to fetch" }), { status: 500 });
+      }
+    } else if (url.pathname.startsWith('/api/stream/')) {
+      const matchId = url.pathname.split('/').pop();
+      try {
+        const response = await fetch(`https://streamed.pk/api/match/${matchId}`);
         
-        // Return JSON with CORS headers to allow your frontend to fetch it
+        const contentType = response.headers.get("content-type");
+        if (!contentType || !contentType.includes("application/json")) {
+          const text = await response.text();
+          console.error(`Stream fetch returned non-JSON (status ${response.status}): ${text.substring(0, 100)}`);
+          return new Response(JSON.stringify({ error: "API returned non-JSON", status: response.status, text: text.substring(0, 100) }), { status: 500 });
+        }
+
+        const data = await response.json();
         return new Response(JSON.stringify(data), {
-          headers: {
-            'content-type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-          },
+          headers: { 'content-type': 'application/json', 'Access-Control-Allow-Origin': '*' },
         });
       } catch (error) {
-        return new Response(JSON.stringify({ error: "Failed to fetch" }), { status: 500 });
+        console.error('Stream fetch failed:', error);
+        return new Response(JSON.stringify({ error: "Failed to fetch stream" }), { status: 500 });
       }
     }
     
