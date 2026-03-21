@@ -2,7 +2,24 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     
-    // Only handle API requests
+    // Handle stream proxying
+    const streamUrl = url.searchParams.get('url');
+    if (streamUrl) {
+      try {
+        const response = await fetch(streamUrl);
+        const newHeaders = new Headers(response.headers);
+        newHeaders.set("Access-Control-Allow-Origin", "*");
+        newHeaders.delete("X-Frame-Options"); // Kill the block
+        newHeaders.delete("Content-Security-Policy"); // Kill the security wall
+        newHeaders.set("Referrer-Policy", "no-referrer");
+
+        return new Response(response.body, { status: response.status, headers: newHeaders });
+      } catch (error) {
+        return new Response("Proxy Failed", { status: 500 });
+      }
+    }
+
+    // Handle API requests
     if (url.pathname === '/api/sports') {
       const category = url.searchParams.get('category') || 'All Sports';
       const urls = {
