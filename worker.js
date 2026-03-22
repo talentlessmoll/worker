@@ -46,7 +46,7 @@ export default {
           let sportName = category;
           if (category === 'Soccer') sportName = 'Football';
           
-          const sport = sports.find((s: any) => s.name.toLowerCase() === sportName.toLowerCase());
+          const sport = sports.find((s) => s.name.toLowerCase() === sportName.toLowerCase());
           
           if (!sport) {
             return new Response(JSON.stringify({ error: "Sport not found" }), { status: 404 });
