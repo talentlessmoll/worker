@@ -1,13 +1,13 @@
 /**
- * HEXARO INFRASTRUCTURE v3.1
- * MIME Type & Proxy Fix
+ * HEXARO INFRASTRUCTURE v3.2
+ * THE FULL PROXY: Spoofing + MIME Fix + CORS
  */
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
     const targetUrl = url.searchParams.get("url");
-    if (!targetUrl) return new Response("Missing URL", { status: 400 });
+    if (!targetUrl) return new Response("Hexaro: No URL", { status: 400 });
 
     try {
       const response = await fetch(targetUrl, {
@@ -24,10 +24,11 @@ export default {
       newHeaders.delete("Content-Security-Policy");
       newHeaders.set("Referrer-Policy", "no-referrer");
 
-      // FORCE CORRECT MIME TYPES (Fixes fff.bin error)
-      if (targetUrl.includes('.webp')) newHeaders.set("Content-Type", "image/webp");
-      if (targetUrl.includes('.png')) newHeaders.set("Content-Type", "image/png");
-      if (targetUrl.includes('.jpg') || targetUrl.includes('.jpeg')) newHeaders.set("Content-Type", "image/jpeg");
+      // FIX FOR THUMBNAILS (MIME TYPE ENFORCEMENT)
+      const t = targetUrl.toLowerCase();
+      if (t.includes('.webp')) newHeaders.set("Content-Type", "image/webp");
+      else if (t.includes('.png')) newHeaders.set("Content-Type", "image/png");
+      else if (t.includes('.jpg') || t.includes('.jpeg')) newHeaders.set("Content-Type", "image/jpeg");
 
       return new Response(response.body, { status: response.status, headers: newHeaders });
     } catch (e) {
