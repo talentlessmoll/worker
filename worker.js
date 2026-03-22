@@ -1,52 +1,53 @@
-function renderGrid(data) {
-    const grid = document.getElementById('grid');
-    if (data.length === 0) { 
-        grid.innerHTML = '<div class="loading-msg">NO MATCHES CURRENTLY ACTIVE</div>'; 
-        return; 
+/**
+ * HEXARO INFRASTRUCTURE v5.2
+ * FIXED EXPORT STRUCTURE
+ */
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const targetUrl = url.searchParams.get("url");
+
+    // If no URL is provided, don't just crash; give a helpful response
+    if (!targetUrl) {
+      return new Response("Hexaro Proxy: Active. Please provide a ?url= parameter.", {
+        status: 200,
+        headers: { "Content-Type": "text/plain", "Access-Control-Allow-Origin": "*" }
+      });
     }
 
-    grid.innerHTML = data.map(m => {
-        // Start with the API's team objects
-        let homeName = m.teams?.home?.name;
-        let awayName = m.teams?.away?.name;
-
-        // If team objects are missing/empty, we hunt the title string
-        if (!homeName || homeName.toLowerCase() === 'home') {
-            // Split by: " vs ", " vs. ", " - ", or " @ " (case insensitive)
-            const parts = m.title.split(/\s+vs\.?\s+|\s+-\s+|\s+@\s+/i);
-            
-            if (parts.length >= 2) {
-                homeName = parts[0].trim();
-                awayName = parts[1].trim();
-            } else {
-                // If no separator exists (e.g. "UFC 300" or "LIV Golf")
-                homeName = m.title;
-                awayName = null; 
-            }
+    try {
+      // Spoof identity to bypass bot protection
+      const response = await fetch(targetUrl, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
+          "Referer": "https://streamed.pk/",
+          "Origin": "https://streamed.pk/"
         }
-        
-        const isLive = m.category === 'live';
-        const matchDate = new Date(m.date);
-        const formattedTime = matchDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-        
-        const timeStatus = isLive ? `<span class="live-dot">● LIVE</span>` : `<span>${formattedTime}</span>`;
-        
-        // Render one centered name if it's a solo event, otherwise do the VS layout
-        const teamDisplay = awayName 
-            ? `<span>${homeName}</span> <span class="vs">vs</span> <span>${awayName}</span>`
-            : `<span style="display:block; width:100%; text-align:center;">${homeName}</span>`;
+      });
 
-        return `
-            <div class="card">
-                <div class="card-meta">
-                    <span>${m.category.toUpperCase()}</span>
-                    ${timeStatus}
-                </div>
-                <div class="card-teams">
-                    ${teamDisplay}
-                </div>
-                <button class="btn" onclick="watchClick('${m.id}')">WATCH BROADCAST</button>
-            </div>
-        `;
-    }).join('');
-}
+      // Clone headers and strip security restrictions
+      const nH = new Headers(response.headers);
+      nH.set("Access-Control-Allow-Origin", "*");
+      nH.delete("X-Frame-Options");
+      nH.delete("Content-Security-Policy");
+      nH.set("Referrer-Policy", "no-referrer");
+
+      // MIME Fix for binary/fff.bin issues
+      const t = targetUrl.toLowerCase();
+      if (t.includes('.webp')) nH.set("Content-Type", "image/webp");
+      else if (t.includes('.png')) nH.set("Content-Type", "image/png");
+      else if (t.includes('.jpg') || t.includes('.jpeg')) nH.set("Content-Type", "image/jpeg");
+
+      return new Response(response.body, {
+        status: response.status,
+        headers: nH
+      });
+    } catch (e) {
+      return new Response("Hexaro Worker Error: " + e.message, { 
+        status: 500,
+        headers: { "Access-Control-Allow-Origin": "*" }
+      });
+    }
+  }
+};
