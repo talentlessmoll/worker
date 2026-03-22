@@ -1,38 +1,47 @@
 /**
- * HEXARO INFRASTRUCTURE v3.2
- * THE FULL PROXY: Spoofing + MIME Fix + CORS
+ * HEXARO INFRASTRUCTURE v4.0
+ * PROXY + MIME FIX + LOGO CACHE
  */
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
     const targetUrl = url.searchParams.get("url");
-    if (!targetUrl) return new Response("Hexaro: No URL", { status: 400 });
+    if (!targetUrl) return new Response("Hexaro: Missing URL", { status: 400 });
 
-    try {
-      const response = await fetch(targetUrl, {
+    // Use Cloudflare's cache to stay under API limits
+    const cache = caches.default;
+    let response = await cache.match(request);
+
+    if (!response) {
+      response = await fetch(targetUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36",
           "Referer": "https://streamed.pk/",
-          "Origin": "https://streamed.pk/"
         }
       });
 
-      const newHeaders = new Headers(response.headers);
+      // Clone and fix headers
+      let newHeaders = new Headers(response.headers);
       newHeaders.set("Access-Control-Allow-Origin", "*");
       newHeaders.delete("X-Frame-Options");
       newHeaders.delete("Content-Security-Policy");
-      newHeaders.set("Referrer-Policy", "no-referrer");
-
-      // FIX FOR THUMBNAILS (MIME TYPE ENFORCEMENT)
+      
+      // MIME TYPE FIX (No more fff.bin)
       const t = targetUrl.toLowerCase();
       if (t.includes('.webp')) newHeaders.set("Content-Type", "image/webp");
       else if (t.includes('.png')) newHeaders.set("Content-Type", "image/png");
-      else if (t.includes('.jpg') || t.includes('.jpeg')) newHeaders.set("Content-Type", "image/jpeg");
+      else if (t.includes('.jpg')) newHeaders.set("Content-Type", "image/jpeg");
 
-      return new Response(response.body, { status: response.status, headers: newHeaders });
-    } catch (e) {
-      return new Response("Worker Error: " + e.message, { status: 500 });
+      // Cache logos for 24 hours to save your 30 req/min quota
+      if (targetUrl.includes('thesportsdb') || targetUrl.includes('badges')) {
+        newHeaders.set("Cache-Control", "public, max-age=86400");
+      }
+
+      response = new Response(response.body, { status: response.status, headers: newHeaders });
+      if (request.method === "GET") await cache.put(request, response.clone());
     }
+
+    return response;
   }
 };
