@@ -2,7 +2,7 @@
  * Cloudflare Email Worker for Hexaro Mail Engine
  * Domain Context: hexaro.name.ng
  * Intercepts all inbound email traffic, filters attachments to inline links,
- * and securely forwards metadata to the Firebase Cloud Function Webhook.
+ * and securely forwards metadata to key target backends.
  */
 
 export default {
@@ -73,7 +73,7 @@ export default {
       return;
     }
 
-    // Direct Integration with Supabase
+    // Direct Integration with Supabase (Free & offline-ready table storage)
     if (supabaseUrl && supabaseKey) {
       const maskedKey = supabaseKey.length > 8 ? `${supabaseKey.substring(0, 4)}...${supabaseKey.substring(supabaseKey.length - 4)}` : "invalid";
       console.log(`Direct Supabase integration active. Host: ${supabaseUrl}, Key: ${maskedKey}`);
@@ -115,7 +115,7 @@ export default {
       }
     }
 
-    // Secondary Integration with Firebase Webhook
+    // Secondary Integration with Firebase Webhook (Optional)
     if (webhookUrl && workerSecret) {
       console.log("Firebase webhook forwarding active. Sending HTTP POST request...");
       try {
@@ -138,7 +138,7 @@ export default {
       }
     }
 
-    // 6. Direct Integration with OneSignal Push Notifications
+    // 6. Direct Integration with OneSignal Push Notifications (Optional)
     const onesignalApiKey = (env.ONESIGNAL_REST_API_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
     const onesignalAppId = (env.ONESIGNAL_APP_ID || "eae94a0f-7594-41bd-8742-6c95cbbfd046").trim().replace(/^["']|["']$/g, "").trim();
 
@@ -193,13 +193,14 @@ export default {
 };
 
 /**
- * Parses raw email body using regex to find body and extract any inline links
- * while dropping binary/multimedia MIME streams to keep the engine lightweight.
+ * Parses raw email body using regex to find body and extract any inline links (e.g., http/https attachments)
+ * while dropping massive binary/multimedia MIME streams to keep the engine lightweight.
  */
 function extractPlaintextAndLinks(rawEmail) {
   let text = "";
   let links = [];
 
+  // Match URL links
   const urlRegex = /https?:\/\/[^\s"'<>]+/g;
   let match;
   while ((match = urlRegex.exec(rawEmail)) !== null) {
@@ -208,6 +209,7 @@ function extractPlaintextAndLinks(rawEmail) {
     }
   }
 
+  // Basic MIME-Multipart stripper to isolate Content-Type: text/plain
   const parts = rawEmail.split(/\r?\n\r?\n/);
   if (parts.length > 1) {
     const contentParts = parts.slice(1);
@@ -239,23 +241,72 @@ function extractPlaintextAndLinks(rawEmail) {
 }
 
 /**
- * Extracts numeric or alphanumeric verification codes from email subject or body.
+ * Extracts numeric or alphanumeric verification codes (OTP) from email subject or body.
  */
 function extractOtpCode(subject, body) {
   const combined = `${subject}\n${body}`;
-  const patterns = [
-    /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation)\s*(?:is|:|=-)?\s*\b([a-zA-Z0-9-]{4,8})\b/i,
-    /\b([0-9]{4,8})\b/
-  ];
-  for (const pattern of patterns) {
-    const match = combined.match(pattern);
-    if (match && match[1]) {
-      const code = match[1].trim();
-      if (code.length === 4 && /^(19|20)\d\d$/.test(code)) {
-        continue;
-      }
+
+  // 1. Clearly labeled numeric codes on the same line
+  const nearKeywords = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation)[^\r\n]{0,30}\b(\d{4,8})\b/i;
+  let match = combined.match(nearKeywords);
+  if (match && match[1]) {
+    const code = match[1].trim();
+    if (code.length === 4 && /^(19|20)\d\d$/.test(code)) {
+      // Skip year
+    } else {
       return code;
     }
   }
+
+  // 1b. Clearly labeled alphanumeric codes (uppercase or containing digit) on the same line
+  const nearKeywordsAlpha = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation)[^\r\n]{0,30}\b([a-zA-Z0-9-]{4,8})\b/i;
+  match = combined.match(nearKeywordsAlpha);
+  if (match && match[1]) {
+    const code = match[1].trim();
+    const hasDigits = /\d/.test(code);
+    const isUpper = code === code.toUpperCase();
+    const isLower = code === code.toLowerCase();
+    const noise = ["that", "this", "your", "from", "with", "have", "here", "click", "about", "html", "class", "style", "span", "div", "charset"];
+    
+    if ((hasDigits || isUpper) && !isLower && !noise.includes(code.toLowerCase())) {
+      return code;
+    }
+  }
+
+  // 2. Space separated digits like "4 0 4 4 9 2"
+  const spacedDigitsRegex = /\b(\d(?:[ \t]+\d){3,7})\b/g;
+  const spacedMatches = combined.match(spacedDigitsRegex);
+  if (spacedMatches) {
+    for (const rawMatch of spacedMatches) {
+      const cleanCode = rawMatch.replace(/\s+/g, "");
+      if (cleanCode.length >= 4 && cleanCode.length <= 8) {
+        if (cleanCode.length === 4 && /^(19|20)\d\d$/.test(cleanCode)) {
+          continue;
+        }
+        return cleanCode;
+      }
+    }
+  }
+
+  // 3. Isolated consecutive digits of length 5 to 8
+  const isolatedDigits = /\b(\d{5,8})\b/g;
+  const digitMatches = combined.match(isolatedDigits);
+  if (digitMatches) {
+    for (const code of digitMatches) {
+      return code;
+    }
+  }
+
+  // 4. Isolated consecutive 4 digits of length 4 (check if not year)
+  const isolatedFourDigits = /\b(\d{4})\b/g;
+  const fourDigitMatches = combined.match(isolatedFourDigits);
+  if (fourDigitMatches) {
+    for (const code of fourDigitMatches) {
+      if (!/^(19|20)\d\d$/.test(code)) {
+        return code;
+      }
+    }
+  }
+
   return null;
-                                                                                         }
+    }
