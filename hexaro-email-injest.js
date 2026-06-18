@@ -2,7 +2,7 @@
  * Cloudflare Email Worker for Hexaro Mail Engine
  * Domain Context: hexaro.name.ng
  * Intercepts all inbound email traffic, filters attachments to inline links,
- * and securely forwards metadata to key target backends.
+ * and securely forwards metadata to the Firebase Cloud Function Webhook.
  */
 
 export default {
@@ -33,6 +33,8 @@ export default {
     }
 
     // 3. Lightweight Parsing to extract plaintext email content and filter attachments
+    // We parse basic headers and content. For a production-ready light parser,
+    // we search for the plaintext parts and extract URLs (inline link attachments).
     const parsedBody = extractPlaintextAndLinks(rawEmail);
 
     // Parse a guaranteed safe numeric timestamp (milliseconds) to prevent NaN serialization issues
@@ -73,7 +75,7 @@ export default {
       return;
     }
 
-    // Direct Integration with Supabase (Free & offline-ready table storage)
+    // Direct Integration with Supabase (Free & does not require serverless cloud functions/billing plans)
     if (supabaseUrl && supabaseKey) {
       const maskedKey = supabaseKey.length > 8 ? `${supabaseKey.substring(0, 4)}...${supabaseKey.substring(supabaseKey.length - 4)}` : "invalid";
       console.log(`Direct Supabase integration active. Host: ${supabaseUrl}, Key: ${maskedKey}`);
@@ -115,7 +117,7 @@ export default {
       }
     }
 
-    // Secondary Integration with Firebase Webhook (Optional)
+    // Secondary Integration with Firebase Webhook (Optional - requires Blaze billing plan for Firebase cloud functions)
     if (webhookUrl && workerSecret) {
       console.log("Firebase webhook forwarding active. Sending HTTP POST request...");
       try {
@@ -210,18 +212,22 @@ function extractPlaintextAndLinks(rawEmail) {
   }
 
   // Basic MIME-Multipart stripper to isolate Content-Type: text/plain
+  // If the email is single-part simple text, we grab the message after headers
   const parts = rawEmail.split(/\r?\n\r?\n/);
   if (parts.length > 1) {
+    // Skip headers block (first block)
     const contentParts = parts.slice(1);
     const textBlocks = [];
 
     for (const block of contentParts) {
+      // Filter out massive base64 or attachment blocks
       if (block.includes("Content-Type: text/plain") || !block.includes("Content-Transfer-Encoding: base64")) {
+        // Clean multi-part headers from this sub-block if present
         const sanitizedBlock = block
           .replace(/Content-Type: [^\s]+/gi, "")
           .replace(/Content-Transfer-Encoding: [^\s]+/gi, "")
           .replace(/Content-Disposition: [^\s]+/gi, "")
-          .replace(/--[a-zA-Z0-9+=_'-]+/g, "")
+          .replace(/--[a-zA-Z0-9+=_'-]+/g, "") // remove boundaries
           .trim();
         
         if (sanitizedBlock.length > 0 && sanitizedBlock.length < 15000) {
@@ -233,6 +239,7 @@ function extractPlaintextAndLinks(rawEmail) {
     text = textBlocks.join("\n\n").trim();
   }
 
+  // Fallback if formatting was simple/flat
   if (!text) {
     text = rawEmail.length > 5000 ? rawEmail.substring(0, 5000) + "... (Truncated)" : rawEmail;
   }
@@ -241,72 +248,109 @@ function extractPlaintextAndLinks(rawEmail) {
 }
 
 /**
+ * Drastically cleans HTML string to plain text.
+ */
+function stripHtml(html) {
+  let text = html || "";
+  // 1. Remove style blocks completely
+  text = text.replace(/<style\b[^>]*>.*?<\/style>/gs, "");
+  // 2. Remove script blocks completely
+  text = text.replace(/<script\b[^>]*>.*?<\/script>/gs, "");
+  // 3. Remove all HTML tags
+  text = text.replace(/<[^>]+>/g, " ");
+  // 4. Decode HTML entities
+  text = text.replace(/&amp;/g, "&")
+             .replace(/&nbsp;/g, " ")
+             .replace(/&lt;/g, "<")
+             .replace(/&gt;/g, ">")
+             .replace(/&quot;/g, "\"")
+             .replace(/&#39;/g, "'");
+  return text;
+}
+
+/**
+ * Checks if a code is likely styling or formatting noise.
+ */
+function isNoisyOrRepetitive(code) {
+  if (!code) return true;
+  const uniqueChars = new Set(code);
+  if (uniqueChars.size <= 1) return true;
+  
+  if (code.length === 4) {
+    const valInt = parseInt(code, 10);
+    if (!isNaN(valInt) && valInt >= 1900 && valInt <= 2040) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Extracts numeric or alphanumeric verification codes (OTP) from email subject or body.
  */
 function extractOtpCode(subject, body) {
-  const combined = `${subject}\n${body}`;
+  const cleanText = stripHtml(`${subject}\n${body}`);
 
   // 1. Clearly labeled numeric codes on the same line
-  const nearKeywords = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation)[^\r\n]{0,30}\b(\d{4,8})\b/i;
-  let match = combined.match(nearKeywords);
+  const nearKeywords = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation|confirmation|passkey)[^\r\n]{0,30}\b(\d{4,8})\b/i;
+  let match = cleanText.match(nearKeywords);
   if (match && match[1]) {
     const code = match[1].trim();
-    if (code.length === 4 && /^(19|20)\d\d$/.test(code)) {
-      // Skip year
-    } else {
+    if (!isNoisyOrRepetitive(code)) {
       return code;
     }
   }
 
   // 1b. Clearly labeled alphanumeric codes (uppercase or containing digit) on the same line
-  const nearKeywordsAlpha = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation)[^\r\n]{0,30}\b([a-zA-Z0-9-]{4,8})\b/i;
-  match = combined.match(nearKeywordsAlpha);
+  const nearKeywordsAlpha = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation|confirmation|passkey)[^\r\n]{0,30}\b([a-zA-Z0-9-]{4,8})\b/i;
+  match = cleanText.match(nearKeywordsAlpha);
   if (match && match[1]) {
     const code = match[1].trim();
     const hasDigits = /\d/.test(code);
     const isUpper = code === code.toUpperCase();
     const isLower = code === code.toLowerCase();
-    const noise = ["that", "this", "your", "from", "with", "have", "here", "click", "about", "html", "class", "style", "span", "div", "charset"];
+    const noise = ["that", "this", "your", "from", "with", "have", "here", "click", "about", "html", "class", "style", "span", "div", "charset", "email"];
     
-    if ((hasDigits || isUpper) && !isLower && !noise.includes(code.toLowerCase())) {
+    if ((hasDigits || isUpper) && !isLower && !noise.includes(code.toLowerCase()) && !isNoisyOrRepetitive(code)) {
       return code;
     }
   }
 
   // 2. Space separated digits like "4 0 4 4 9 2"
   const spacedDigitsRegex = /\b(\d(?:[ \t]+\d){3,7})\b/g;
-  const spacedMatches = combined.match(spacedDigitsRegex);
+  const spacedMatches = cleanText.match(spacedDigitsRegex);
   if (spacedMatches) {
     for (const rawMatch of spacedMatches) {
       const cleanCode = rawMatch.replace(/\s+/g, "");
       if (cleanCode.length >= 4 && cleanCode.length <= 8) {
-        if (cleanCode.length === 4 && /^(19|20)\d\d$/.test(cleanCode)) {
-          continue;
+        if (!isNoisyOrRepetitive(cleanCode)) {
+          return cleanCode;
         }
-        return cleanCode;
       }
     }
   }
 
   // 3. Isolated consecutive digits of length 5 to 8
   const isolatedDigits = /\b(\d{5,8})\b/g;
-  const digitMatches = combined.match(isolatedDigits);
+  const digitMatches = cleanText.match(isolatedDigits);
   if (digitMatches) {
     for (const code of digitMatches) {
-      return code;
+      if (!isNoisyOrRepetitive(code)) {
+        return code;
+      }
     }
   }
 
   // 4. Isolated consecutive 4 digits of length 4 (check if not year)
   const isolatedFourDigits = /\b(\d{4})\b/g;
-  const fourDigitMatches = combined.match(isolatedFourDigits);
+  const fourDigitMatches = cleanText.match(isolatedFourDigits);
   if (fourDigitMatches) {
     for (const code of fourDigitMatches) {
-      if (!/^(19|20)\d\d$/.test(code)) {
+      if (!isNoisyOrRepetitive(code)) {
         return code;
       }
     }
   }
 
   return null;
-    }
+      }
