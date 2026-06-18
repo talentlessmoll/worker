@@ -4,3 +4,12 @@ compatibility_date = "2024-01-01"
 
 [observability]
 enabled = true
+
+[vars]
+SUPABASE_URL = "https://zazyjnlpdwzxtadtbirm.supabase.co"
+
+[secrets]
+required = [
+  "ONESIGNAL_REST_API_KEY",
+  "SUPABASE_ANON_KEY"
+]
