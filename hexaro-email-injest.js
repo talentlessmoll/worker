@@ -1,8 +1,8 @@
 /**
- * Cloudflare Email Worker for Hexaro Mail Engine 1
+ * Cloudflare Email Worker for Hexaro Mail Engine
  * Domain Context: hexaro.name.ng
  * Intercepts all inbound email traffic, filters attachments to inline links,
- * and securely forwards metadata to Supabase and/or Firebase Cloud Functions.
+ * and securely forwards metadata to the Firebase Cloud Function Webhook.
  */
 
 export default {
@@ -33,8 +33,6 @@ export default {
     }
 
     // 3. Lightweight Parsing to extract plaintext email content and filter attachments
-    // We parse basic headers and content. For a production-ready light parser,
-    // we search for the plaintext parts and extract URLs (inline link attachments).
     const parsedBody = extractPlaintextAndLinks(rawEmail);
 
     // Parse a guaranteed safe numeric timestamp (milliseconds) to prevent NaN serialization issues
@@ -58,6 +56,9 @@ export default {
       timestamp: new Date(timestampMs).toISOString()
     };
 
+    // Extract OTP Code if any
+    const otpCode = extractOtpCode(subject, parsedBody.text);
+
     // 5. Route to Target Backends (Supabase and/or Firebase) with sanitization
     const supabaseUrl = (env.SUPABASE_URL || "").trim().replace(/^["']|["']$/g, "").trim();
     const supabaseKey = (env.SUPABASE_ANON_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
@@ -72,7 +73,7 @@ export default {
       return;
     }
 
-    // Direct Integration with Supabase (Free & does not require serverless cloud functions/billing plans)
+    // Direct Integration with Supabase
     if (supabaseUrl && supabaseKey) {
       const maskedKey = supabaseKey.length > 8 ? `${supabaseKey.substring(0, 4)}...${supabaseKey.substring(supabaseKey.length - 4)}` : "invalid";
       console.log(`Direct Supabase integration active. Host: ${supabaseUrl}, Key: ${maskedKey}`);
@@ -114,7 +115,7 @@ export default {
       }
     }
 
-    // Secondary Integration with Firebase Webhook (Optional - requires Blaze billing plan for Firebase cloud functions)
+    // Secondary Integration with Firebase Webhook
     if (webhookUrl && workerSecret) {
       console.log("Firebase webhook forwarding active. Sending HTTP POST request...");
       try {
@@ -137,7 +138,7 @@ export default {
       }
     }
 
-    // 6. Direct Integration with OneSignal Push Notifications (Optional)
+    // 6. Direct Integration with OneSignal Push Notifications
     const onesignalApiKey = (env.ONESIGNAL_REST_API_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
     const onesignalAppId = (env.ONESIGNAL_APP_ID || "eae94a0f-7594-41bd-8742-6c95cbbfd046").trim().replace(/^["']|["']$/g, "").trim();
 
@@ -149,16 +150,20 @@ export default {
           authHeader = `Basic ${authHeader}`;
         }
 
+        const headingText = otpCode ? `🔑 OTP: ${otpCode} | ${sender}` : `New Mail: ${sender}`;
+        const contentText = otpCode ? `Verification Code: ${otpCode} | Subject: ${subject || "(No Subject)"}` : (subject || "(No Subject)");
+
         const osPayload = {
           app_id: onesignalAppId,
           included_segments: ["All"],
-          headings: { en: `New Mail: ${sender}` },
-          contents: { en: subject || "(No Subject)" },
+          headings: { en: headingText },
+          contents: { en: contentText },
           data: {
             notification_type: "new_email",
             sender: sender,
             recipient: recipient,
             subject: subject || "(No Subject)",
+            otp_code: otpCode,
             snippet: parsedBody.text.length > 120 ? `${parsedBody.text.substring(0, 117)}...` : parsedBody.text
           },
           android_group: "incoming_emails_group"
@@ -188,14 +193,13 @@ export default {
 };
 
 /**
- * Parses raw email body using regex to find body and extract any inline links (e.g., http/https attachments)
- * while dropping massive binary/multimedia MIME streams to keep the engine lightweight.
+ * Parses raw email body using regex to find body and extract any inline links
+ * while dropping binary/multimedia MIME streams to keep the engine lightweight.
  */
 function extractPlaintextAndLinks(rawEmail) {
   let text = "";
   let links = [];
 
-  // Match URL links
   const urlRegex = /https?:\/\/[^\s"'<>]+/g;
   let match;
   while ((match = urlRegex.exec(rawEmail)) !== null) {
@@ -204,23 +208,18 @@ function extractPlaintextAndLinks(rawEmail) {
     }
   }
 
-  // Basic MIME-Multipart stripper to isolate Content-Type: text/plain
-  // If the email is single-part simple text, we grab the message after headers
   const parts = rawEmail.split(/\r?\n\r?\n/);
   if (parts.length > 1) {
-    // Skip headers block (first block)
     const contentParts = parts.slice(1);
     const textBlocks = [];
 
     for (const block of contentParts) {
-      // Filter out massive base64 or attachment blocks
       if (block.includes("Content-Type: text/plain") || !block.includes("Content-Transfer-Encoding: base64")) {
-        // Clean multi-part headers from this sub-block if present
         const sanitizedBlock = block
           .replace(/Content-Type: [^\s]+/gi, "")
           .replace(/Content-Transfer-Encoding: [^\s]+/gi, "")
           .replace(/Content-Disposition: [^\s]+/gi, "")
-          .replace(/--[a-zA-Z0-9+=_'-]+/g, "") // remove boundaries
+          .replace(/--[a-zA-Z0-9+=_'-]+/g, "")
           .trim();
         
         if (sanitizedBlock.length > 0 && sanitizedBlock.length < 15000) {
@@ -232,10 +231,31 @@ function extractPlaintextAndLinks(rawEmail) {
     text = textBlocks.join("\n\n").trim();
   }
 
-  // Fallback if formatting was simple/flat
   if (!text) {
     text = rawEmail.length > 5000 ? rawEmail.substring(0, 5000) + "... (Truncated)" : rawEmail;
   }
 
   return { text, links };
 }
+
+/**
+ * Extracts numeric or alphanumeric verification codes from email subject or body.
+ */
+function extractOtpCode(subject, body) {
+  const combined = `${subject}\n${body}`;
+  const patterns = [
+    /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation)\s*(?:is|:|=-)?\s*\b([a-zA-Z0-9-]{4,8})\b/i,
+    /\b([0-9]{4,8})\b/
+  ];
+  for (const pattern of patterns) {
+    const match = combined.match(pattern);
+    if (match && match[1]) {
+      const code = match[1].trim();
+      if (code.length === 4 && /^(19|20)\d\d$/.test(code)) {
+        continue;
+      }
+      return code;
+    }
+  }
+  return null;
+                                                                                         }
