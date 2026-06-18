@@ -1,5 +1,5 @@
 /**
- * Cloudflare Email Worker for Hexaro Mail Engine
+ * Cloudflare Email Worker for Hexaro Mail Engine 1
  * Domain Context: hexaro.name.ng
  * Intercepts all inbound email traffic, filters attachments to inline links,
  * and securely forwards metadata to Supabase and/or Firebase Cloud Functions.
