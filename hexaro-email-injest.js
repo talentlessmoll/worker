@@ -2,13 +2,22 @@
  * Cloudflare Email Worker for Hexaro Mail Engine
  * Domain Context: hexaro.name.ng
  * Intercepts all inbound email traffic, filters attachments to inline links,
- * and securely forwards metadata to the Firebase Cloud Function Webhook.
+ * and securely forwards metadata to Supabase and/or Firebase Cloud Functions.
  */
 
 export default {
   async email(message, env, ctx) {
     // 1. Core Header and Routing Metadata Extraction
-    const sender = message.from;
+    let sender = message.from;
+    const fromHeader = message.headers.get("from") || message.headers.get("From");
+    if (fromHeader) {
+      const emailMatch = fromHeader.match(/<([^>]+)>/);
+      if (emailMatch && emailMatch[1]) {
+        sender = emailMatch[1].trim();
+      } else {
+        sender = fromHeader.trim().replace(/^["']|["']$/g, "").trim();
+      }
+    }
     const recipient = message.to;
     const subject = message.headers.get("subject") || "(No Subject)";
     const dateStr = message.headers.get("date") || new Date().toISOString();
@@ -28,6 +37,17 @@ export default {
     // we search for the plaintext parts and extract URLs (inline link attachments).
     const parsedBody = extractPlaintextAndLinks(rawEmail);
 
+    // Parse a guaranteed safe numeric timestamp (milliseconds) to prevent NaN serialization issues
+    let timestampMs = Date.now();
+    if (dateStr) {
+      try {
+        const parsed = new Date(dateStr).getTime();
+        if (!isNaN(parsed)) {
+          timestampMs = parsed;
+        }
+      } catch (e) {}
+    }
+
     // 4. Construct Payload
     const webhookPayload = {
       sender: sender,
@@ -35,7 +55,7 @@ export default {
       subject: subject,
       body: parsedBody.text,
       links: parsedBody.links,
-      timestamp: new Date(dateStr).toISOString()
+      timestamp: new Date(timestampMs).toISOString()
     };
 
     // 5. Route to Target Backends (Supabase and/or Firebase) with sanitization
@@ -43,6 +63,9 @@ export default {
     const supabaseKey = (env.SUPABASE_ANON_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
     const webhookUrl = (env.FIREBASE_FUNCTION_URL || "").trim().replace(/^["']|["']$/g, "").trim();
     const workerSecret = (env.WORKER_SECRET || "").trim().replace(/^["']|["']$/g, "").trim();
+
+    console.log(`Routing context - Recipient: ${recipient}, Sender: ${sender}, Subject: ${subject}`);
+    console.log(`Configuration diagnostic - Supabase URL: "${supabaseUrl ? supabaseUrl.substring(0, 15) + "..." : ""}" (exists: ${!!supabaseUrl}), Supabase Key exists: ${!!supabaseKey}`);
 
     if (!supabaseUrl && !webhookUrl) {
       console.error("Configuration missing: Neither SUPABASE_URL nor FIREBASE_FUNCTION_URL is defined. Please configure at least one backend in your Worker environment variables.");
@@ -65,7 +88,7 @@ export default {
           recipient: recipient,
           subject: subject,
           body: parsedBody.text,
-          timestamp: new Date(dateStr).getTime() || Date.now(),
+          timestamp: timestampMs,
           serialized_links: parsedBody.links.join(",")
         };
 
@@ -215,4 +238,4 @@ function extractPlaintextAndLinks(rawEmail) {
   }
 
   return { text, links };
-        }
+}
