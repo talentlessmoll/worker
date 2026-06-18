@@ -1,5 +1,5 @@
-name = "worker"
-main = "worker.js"
+name = "hexaro-email-injest"
+main = "hexaro-email-injest.js"
 compatibility_date = "2024-01-01"
 
 [observability]
