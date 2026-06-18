@@ -33,8 +33,6 @@ export default {
     }
 
     // 3. Lightweight Parsing to extract plaintext email content and filter attachments
-    // We parse basic headers and content. For a production-ready light parser,
-    // we search for the plaintext parts and extract URLs (inline link attachments).
     const parsedBody = extractPlaintextAndLinks(rawEmail);
 
     // Parse a guaranteed safe numeric timestamp (milliseconds) to prevent NaN serialization issues
@@ -75,7 +73,7 @@ export default {
       return;
     }
 
-    // Direct Integration with Supabase (Free & does not require serverless cloud functions/billing plans)
+    // Direct Integration with Supabase
     if (supabaseUrl && supabaseKey) {
       const maskedKey = supabaseKey.length > 8 ? `${supabaseKey.substring(0, 4)}...${supabaseKey.substring(supabaseKey.length - 4)}` : "invalid";
       console.log(`Direct Supabase integration active. Host: ${supabaseUrl}, Key: ${maskedKey}`);
@@ -117,7 +115,7 @@ export default {
       }
     }
 
-    // Secondary Integration with Firebase Webhook (Optional - requires Blaze billing plan for Firebase cloud functions)
+    // Secondary Integration with Firebase Webhook
     if (webhookUrl && workerSecret) {
       console.log("Firebase webhook forwarding active. Sending HTTP POST request...");
       try {
@@ -140,7 +138,7 @@ export default {
       }
     }
 
-    // 6. Direct Integration with OneSignal Push Notifications (Optional)
+    // 6. Direct Integration with OneSignal Push Notifications
     const onesignalApiKey = (env.ONESIGNAL_REST_API_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
     const onesignalAppId = (env.ONESIGNAL_APP_ID || "eae94a0f-7594-41bd-8742-6c95cbbfd046").trim().replace(/^["']|["']$/g, "").trim();
 
@@ -195,14 +193,12 @@ export default {
 };
 
 /**
- * Parses raw email body using regex to find body and extract any inline links (e.g., http/https attachments)
- * while dropping massive binary/multimedia MIME streams to keep the engine lightweight.
+ * Parses raw email body using regex to find body and extract any inline links.
  */
 function extractPlaintextAndLinks(rawEmail) {
   let text = "";
   let links = [];
 
-  // Match URL links
   const urlRegex = /https?:\/\/[^\s"'<>]+/g;
   let match;
   while ((match = urlRegex.exec(rawEmail)) !== null) {
@@ -211,23 +207,18 @@ function extractPlaintextAndLinks(rawEmail) {
     }
   }
 
-  // Basic MIME-Multipart stripper to isolate Content-Type: text/plain
-  // If the email is single-part simple text, we grab the message after headers
   const parts = rawEmail.split(/\r?\n\r?\n/);
   if (parts.length > 1) {
-    // Skip headers block (first block)
     const contentParts = parts.slice(1);
     const textBlocks = [];
 
     for (const block of contentParts) {
-      // Filter out massive base64 or attachment blocks
       if (block.includes("Content-Type: text/plain") || !block.includes("Content-Transfer-Encoding: base64")) {
-        // Clean multi-part headers from this sub-block if present
         const sanitizedBlock = block
           .replace(/Content-Type: [^\s]+/gi, "")
           .replace(/Content-Transfer-Encoding: [^\s]+/gi, "")
           .replace(/Content-Disposition: [^\s]+/gi, "")
-          .replace(/--[a-zA-Z0-9+=_'-]+/g, "") // remove boundaries
+          .replace(/--[a-zA-Z0-9+=_'-]+/g, "")
           .trim();
         
         if (sanitizedBlock.length > 0 && sanitizedBlock.length < 15000) {
@@ -239,7 +230,6 @@ function extractPlaintextAndLinks(rawEmail) {
     text = textBlocks.join("\n\n").trim();
   }
 
-  // Fallback if formatting was simple/flat
   if (!text) {
     text = rawEmail.length > 5000 ? rawEmail.substring(0, 5000) + "... (Truncated)" : rawEmail;
   }
@@ -252,13 +242,9 @@ function extractPlaintextAndLinks(rawEmail) {
  */
 function stripHtml(html) {
   let text = html || "";
-  // 1. Remove style blocks completely
   text = text.replace(/<style\b[^>]*>.*?<\/style>/gs, "");
-  // 2. Remove script blocks completely
   text = text.replace(/<script\b[^>]*>.*?<\/script>/gs, "");
-  // 3. Remove all HTML tags
   text = text.replace(/<[^>]+>/g, " ");
-  // 4. Decode HTML entities
   text = text.replace(/&amp;/g, "&")
              .replace(/&nbsp;/g, " ")
              .replace(/&lt;/g, "<")
@@ -278,7 +264,13 @@ function isNoisyOrRepetitive(code) {
   
   if (code.length === 4) {
     const valInt = parseInt(code, 10);
-    if (!isNaN(valInt) && valInt >= 1900 && valInt <= 2040) {
+    if (!isNaN(valInt) && valInt >= 1900 && valInt <= 2050) {
+      return true;
+    }
+  }
+  if (code.length === 8) {
+    const firstFour = parseInt(code.substring(0, 4), 10);
+    if (!isNaN(firstFour) && firstFour >= 1900 && firstFour <= 2050) {
       return true;
     }
   }
@@ -291,37 +283,35 @@ function isNoisyOrRepetitive(code) {
 function extractOtpCode(subject, body) {
   const cleanText = stripHtml(`${subject}\n${body}`);
 
-  // 1. Clearly labeled numeric codes on the same line
-  const nearKeywords = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation|confirmation|passkey)[^\r\n]{0,30}\b(\d{4,8})\b/i;
-  let match = cleanText.match(nearKeywords);
-  if (match && match[1]) {
-    const code = match[1].trim();
-    if (!isNoisyOrRepetitive(code)) {
-      return code;
-    }
-  }
-
-  // 1b. Clearly labeled alphanumeric codes (uppercase or containing digit) on the same line
-  const nearKeywordsAlpha = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation|confirmation|passkey)[^\r\n]{0,30}\b([a-zA-Z0-9-]{4,8})\b/i;
-  match = cleanText.match(nearKeywordsAlpha);
-  if (match && match[1]) {
-    const code = match[1].trim();
-    const hasDigits = /\d/.test(code);
-    const isUpper = code === code.toUpperCase();
-    const isLower = code === code.toLowerCase();
-    const noise = ["that", "this", "your", "from", "with", "have", "here", "click", "about", "html", "class", "style", "span", "div", "charset", "email"];
+  // 1. Clearly labeled codes on the same line
+  const nearKeywords = /(?:code|otp|verify|verification|passcode|pin|one-time|security|activation|confirmation|passkey)[^\r\n]{0,30}\b([a-zA-Z0-9][-a-zA-Z0-9\s:]{2,10}[a-zA-Z0-9])\b/gi;
+  let match;
+  while ((match = nearKeywords.exec(cleanText)) !== null) {
+    const rawCode = match[1].trim();
+    const cleanCode = rawCode.replace(/[-\s:]+/g, "");
     
-    if ((hasDigits || isUpper) && !isLower && !noise.includes(code.toLowerCase()) && !isNoisyOrRepetitive(code)) {
-      return code;
+    if (/^\d+$/.test(cleanCode) && cleanCode.length >= 4 && cleanCode.length <= 8) {
+      if (!isNoisyOrRepetitive(cleanCode)) {
+        return cleanCode;
+      }
+    } else if (cleanCode.length >= 4 && cleanCode.length <= 8) {
+      const hasDigits = /\d/.test(cleanCode);
+      const isUpper = cleanCode === cleanCode.toUpperCase();
+      const isLower = cleanCode === cleanCode.toLowerCase();
+      const noise = ["that", "this", "your", "from", "with", "have", "here", "click", "about", "html", "class", "style", "span", "div", "charset", "email"];
+      
+      if ((hasDigits || isUpper) && !isLower && !noise.includes(cleanCode.toLowerCase()) && !isNoisyOrRepetitive(cleanCode)) {
+        return cleanCode;
+      }
     }
   }
 
-  // 2. Space separated digits like "4 0 4 4 9 2"
-  const spacedDigitsRegex = /\b(\d(?:[ \t]+\d){3,7})\b/g;
-  const spacedMatches = cleanText.match(spacedDigitsRegex);
-  if (spacedMatches) {
-    for (const rawMatch of spacedMatches) {
-      const cleanCode = rawMatch.replace(/\s+/g, "");
+  // 2. Space or hyphen separated digits like "666-555" or "6 6 6 5 5 5" or "6 6 6 - 5 5 5"
+  const separatedDigitsRegex = /\b(\d(?:[-\s]?\d){3,7})\b/g;
+  const separatedMatches = cleanText.match(separatedDigitsRegex);
+  if (separatedMatches) {
+    for (const rawMatch of separatedMatches) {
+      const cleanCode = rawMatch.replace(/[-\s]+/g, "");
       if (cleanCode.length >= 4 && cleanCode.length <= 8) {
         if (!isNoisyOrRepetitive(cleanCode)) {
           return cleanCode;
