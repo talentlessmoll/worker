@@ -1,48 +1,150 @@
 /**
- * Hexaro Mail Worker - Core SMTP Packet Forwarder with Smart OTP & Asset Extraction
- * Designed as a lightweight serverless router matching modern Jetpack Compose environments.
+ * Cloudflare Email Worker for Hexaro Mail Engine
+ * Domain Context: hexaro.name.ng
+ * Intercepts all inbound email traffic, filters attachments to inline links,
+ * and securely forwards metadata to the Firebase Cloud Function Webhook.
  */
 
 export default {
   async email(message, env, ctx) {
-    const rawEmail = await new Response(message.raw).text();
-    const sender = message.from;
+    // 1. Core Header and Routing Metadata Extraction
+    let sender = message.from;
+    const fromHeader = message.headers.get("from") || message.headers.get("From");
+    if (fromHeader) {
+      const emailMatch = fromHeader.match(/<([^>]+)>/);
+      if (emailMatch && emailMatch[1]) {
+        sender = emailMatch[1].trim();
+      } else {
+        sender = fromHeader.trim().replace(/^["']|["']$/g, "").trim();
+      }
+    }
     const recipient = message.to;
     const subject = message.headers.get("subject") || "(No Subject)";
+    const dateStr = message.headers.get("date") || new Date().toISOString();
 
-    console.log(`Receiving inbound email envelope. From: ${sender}, To: ${recipient}`);
-
-    // 1. Isolate plain text bodies, links, and drops heavy MIME chunks
-    const parsedBody = extractPlaintextAndLinks(rawEmail);
-
-    // 2. Intelligent Real-time verification code/OTP search
-    const otpCode = extractOtpCode(subject, parsedBody.text);
-    if (otpCode) {
-      console.log(`Identified verification code / OTP: ${otpCode}`);
+    // 2. Read raw email payload to extract bodies and links
+    let rawEmail;
+    try {
+      const rawResponse = new Response(message.raw);
+      rawEmail = await rawResponse.text();
+    } catch (e) {
+      console.error("Failed to read raw email body stream:", e);
+      rawEmail = "";
     }
 
-    // 3. Format webhook routing payload
+    // 3. Lightweight Parsing to extract plaintext email content and filter attachments
+    const parsedBody = extractPlaintextAndLinks(rawEmail);
+
+    // Parse a guaranteed safe numeric timestamp (milliseconds) to prevent NaN serialization issues
+    let timestampMs = Date.now();
+    if (dateStr) {
+      try {
+        const parsed = new Date(dateStr).getTime();
+        if (!isNaN(parsed)) {
+          timestampMs = parsed;
+        }
+      } catch (e) {}
+    }
+
+    // 4. Construct Payload
     const webhookPayload = {
-      id: crypto.randomUUID(),
       sender: sender,
       recipient: recipient,
       subject: subject,
       body: parsedBody.text,
-      timestamp: Date.now(),
-      otp_code: otpCode || null,
-      links: parsedBody.links
+      links: parsedBody.links,
+      timestamp: new Date(timestampMs).toISOString()
     };
 
-    // 4. Discover custom webhook destinations or fall back to default Firebase Webhook endpoint
-    const webhookUrl = (env.FIREBASE_WEBHOOK_URL || "").trim().replace(/^["']|["']$/g, "").trim();
+    // Extract OTP Code if any
+    const otpCode = extractOtpCode(subject, parsedBody.text);
 
-    if (webhookUrl) {
-      console.log(`Dispatching webhook payload to configured endpoint: ${webhookUrl}`);
+    // 5. Route to Target Backends (Supabase and/or Firebase) with sanitization
+    const supabaseUrl = (env.SUPABASE_URL || "").trim().replace(/^["']|["']$/g, "").trim();
+    const supabaseKey = (env.SUPABASE_ANON_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
+    const webhookUrl = (env.FIREBASE_FUNCTION_URL || "").trim().replace(/^["']|["']$/g, "").trim();
+    const workerSecret = (env.WORKER_SECRET || "").trim().replace(/^["']|["']$/g, "").trim();
+
+    console.log(`Routing context - Recipient: ${recipient}, Sender: ${sender}, Subject: ${subject}`);
+    console.log(`Configuration diagnostic - Supabase URL: "${supabaseUrl ? supabaseUrl.substring(0, 15) + "..." : ""}" (exists: ${!!supabaseUrl}), Supabase Key exists: ${!!supabaseKey}`);
+
+    if (!supabaseUrl && !webhookUrl) {
+      console.error("Configuration missing: Neither SUPABASE_URL nor FIREBASE_FUNCTION_URL is defined. Please configure at least one backend in your Worker environment variables.");
+      return;
+    }
+
+    // Direct Integration with Supabase (Free & does not require serverless cloud functions/billing plans)
+    if (supabaseUrl && supabaseKey) {
+      const maskedKey = supabaseKey.length > 8 ? `${supabaseKey.substring(0, 4)}...${supabaseKey.substring(supabaseKey.length - 4)}` : "invalid";
+      console.log(`Direct Supabase integration active. Host: ${supabaseUrl}, Key: ${maskedKey}`);
+      console.log("Stashing mail payload directly in table 'received_emails'...");
+      try {
+        const cleanSupabaseUrl = supabaseUrl.replace(/\/$/, "");
+        const supabaseEndpoint = `${cleanSupabaseUrl}/rest/v1/received_emails`;
+        
+        const emailId = "msg_" + Date.now() + "_" + Math.random().toString(36).substring(2, 10);
+        const supabasePayload = {
+          id: emailId,
+          sender: sender,
+          recipient: recipient,
+          subject: subject,
+          body: parsedBody.text,
+          timestamp: timestampMs,
+          serialized_links: parsedBody.links.join(",")
+        };
+
+        let response = await fetch(supabaseEndpoint, {
+          method: "POST",
+          headers: {
+            "apikey": supabaseKey,
+            "Authorization": `Bearer ${supabaseKey}`,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+          },
+          body: JSON.stringify(supabasePayload)
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          console.warn(`Supabase REST insert returned status ${response.status} with numeric timestamp. Retrying with ISO-8601 string timestamp...`);
+          
+          const retryPayload = {
+            ...supabasePayload,
+            timestamp: new Date(timestampMs).toISOString()
+          };
+
+          response = await fetch(supabaseEndpoint, {
+            method: "POST",
+            headers: {
+              "apikey": supabaseKey,
+              "Authorization": `Bearer ${supabaseKey}`,
+              "Content-Type": "application/json",
+              "Prefer": "return=minimal"
+            },
+            body: JSON.stringify(retryPayload)
+          });
+
+          if (!response.ok) {
+            const retryErrText = await response.text();
+            throw new Error(`Supabase REST retry also failed: ${response.status} ${response.statusText} - ${retryErrText}`);
+          }
+        }
+
+        console.log(`Successfully stored mail in Supabase 'received_emails' table. ID: ${emailId}`);
+      } catch (error) {
+        console.error(`Direct Supabase sync routing failure: ${error.message}`);
+      }
+    }
+
+    // Secondary Integration with Firebase Webhook (Optional - requires Blaze billing plan for Firebase cloud functions)
+    if (webhookUrl && workerSecret) {
+      console.log("Firebase webhook forwarding active. Sending HTTP POST request...");
       try {
         const response = await fetch(webhookUrl, {
           method: "POST",
           headers: {
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-Worker-Secret": workerSecret
           },
           body: JSON.stringify(webhookPayload)
         });
@@ -57,7 +159,7 @@ export default {
       }
     }
 
-    // 5. Direct Integration with OneSignal Push Notifications
+    // 6. Direct Integration with OneSignal Push Notifications (Optional)
     const onesignalApiKey = (env.ONESIGNAL_REST_API_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
     const onesignalAppId = (env.ONESIGNAL_APP_ID || "eae94a0f-7594-41bd-8742-6c95cbbfd046").trim().replace(/^["']|["']$/g, "").trim();
 
@@ -85,7 +187,7 @@ export default {
             sender: sender,
             recipient: recipient,
             subject: subject || "(No Subject)",
-            otp_code: otpCode,
+            otp_code: otpCode || undefined,
             snippet: parsedBody.text.length > 120 ? `${parsedBody.text.substring(0, 117)}...` : parsedBody.text
           },
           android_group: "incoming_emails_group"
@@ -175,50 +277,6 @@ function extractPlaintextAndLinks(rawEmail) {
   }
 
   return { text, links };
-}
-
-/**
- * Drastically cleans HTML string to plain text.
- */
-function stripHtml(html) {
-  let text = html || "";
-  // 1. Remove style blocks completely
-  text = text.replace(/<style\b[^>]*>.*?<\/style>/gs, "");
-  // 2. Remove script blocks completely
-  text = text.replace(/<script\b[^>]*>.*?<\/script>/gs, "");
-  // 3. Remove all HTML tags
-  text = text.replace(/<[^>]+>/g, " ");
-  // 4. Decode HTML entities
-  text = text.replace(/&amp;/g, "&")
-             .replace(/&nbsp;/g, " ")
-             .replace(/&lt;/g, "<")
-             .replace(/&gt;/g, ">")
-             .replace(/&quot;/g, "\"")
-             .replace(/&#39;/g, "'");
-  return text;
-}
-
-/**
- * Checks if a code is likely styling or formatting noise.
- */
-function isNoisyOrRepetitive(code) {
-  if (!code) return true;
-  const uniqueChars = new Set(code);
-  if (uniqueChars.size <= 1) return true;
-  
-  if (code.length === 4) {
-    const valInt = parseInt(code, 10);
-    if (!isNaN(valInt) && valInt >= 1900 && valInt <= 2050) {
-      return true;
-    }
-  }
-  if (code.length === 8) {
-    const firstFour = parseInt(code.substring(0, 4), 10);
-    if (!isNaN(firstFour) && firstFour >= 1900 && firstFour <= 2050) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**
@@ -313,4 +371,37 @@ function extractOtpCode(subject, body) {
   }
 
   return null;
-                            }
+}
+
+function isNoisyOrRepetitive(code) {
+  if (!code) return true;
+  // Exclude sequential numbers
+  if (code === "1234" || code === "12345" || code === "123456" || code === "1234567" || code === "12345678") {
+    return true;
+  }
+  // Exclude identical repeating digits (e.g. 111111)
+  const firstChar = code[0];
+  let allSame = true;
+  for (let i = 1; i < code.length; i++) {
+    if (code[i] !== firstChar) {
+      allSame = false;
+      break;
+    }
+  }
+  return allSame;
+}
+
+function stripHtml(html) {
+  if (!html) return "";
+  let text = html;
+  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ");
+  text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ");
+  text = text.replace(/<[^>]+>/g, " ");
+  text = text.replace(/&nbsp;/gi, " ");
+  text = text.replace(/&amp;/gi, "&");
+  text = text.replace(/&lt;/gi, "<");
+  text = text.replace(/&gt;/gi, ">");
+  text = text.replace(/&quot;/gi, '"');
+  text = text.replace(/\s+/g, " ");
+  return text.trim();
+  }
