@@ -1,4 +1,4 @@
-name = "hexaro-email-injest"
+name = "worker"
 main = "hexaro-email-injest.js"
 compatibility_date = "2024-01-01"
 
