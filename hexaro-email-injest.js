@@ -33,6 +33,8 @@ export default {
     }
 
     // 3. Lightweight Parsing to extract plaintext email content and filter attachments
+    // We parse basic headers and content. For a production-ready light parser,
+    // we search for the plaintext parts and extract URLs (inline link attachments).
     const parsedBody = extractPlaintextAndLinks(rawEmail);
 
     // Parse a guaranteed safe numeric timestamp (milliseconds) to prevent NaN serialization issues
@@ -227,15 +229,15 @@ export default {
 };
 
 /**
- * Parses raw email body using regex to find body and extract any inline links (e.g., http/https attachments)
- * while dropping massive binary/multimedia MIME streams to keep the engine lightweight.
+ * Parses raw email body using robust MIME parsing, extracting plaintext, HTML parts,
+ * and inline hyperlinks, while filtering out attachments and heavy base64 data.
  */
 function extractPlaintextAndLinks(rawEmail) {
   let text = "";
   let links = [];
 
   // Match URL links
-  const urlRegex = /https?:\/\/[^\s"'<>]+/g;
+  const urlRegex = /https?:\/\/[^\s"'<>|\[\]()]+/g;
   let match;
   while ((match = urlRegex.exec(rawEmail)) !== null) {
     if (!links.includes(match[0])) {
@@ -243,40 +245,216 @@ function extractPlaintextAndLinks(rawEmail) {
     }
   }
 
-  // Basic MIME-Multipart stripper to isolate Content-Type: text/plain
-  // If the email is single-part simple text, we grab the message after headers
-  const parts = rawEmail.split(/\r?\n\r?\n/);
-  if (parts.length > 1) {
-    // Skip headers block (first block)
-    const contentParts = parts.slice(1);
-    const textBlocks = [];
+  // 1. Extract boundary parameters from Content-Type headers
+  const boundaries = [];
+  const boundaryMatches = rawEmail.matchAll(/boundary=["']?([^"'\s;]+)["']?/gi);
+  for (const m of boundaryMatches) {
+    if (!boundaries.includes(m[1])) {
+      boundaries.push(m[1]);
+    }
+  }
 
-    for (const block of contentParts) {
-      // Filter out massive base64 or attachment blocks
-      if (block.includes("Content-Type: text/plain") || !block.includes("Content-Transfer-Encoding: base64")) {
-        // Clean multi-part headers from this sub-block if present
-        const sanitizedBlock = block
-          .replace(/Content-Type: [^\s]+/gi, "")
-          .replace(/Content-Transfer-Encoding: [^\s]+/gi, "")
-          .replace(/Content-Disposition: [^\s]+/gi, "")
-          .replace(/--[a-zA-Z0-9+=_'-]+/g, "") // remove boundaries
-          .trim();
-        
-        if (sanitizedBlock.length > 0 && sanitizedBlock.length < 15000) {
-          textBlocks.push(sanitizedBlock);
+  let textParts = [];
+  let htmlParts = [];
+
+  if (boundaries.length > 0) {
+    // Escaping boundaries for safety in regex creation
+    const escapedBoundaries = boundaries.map(b => b.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')).join('|');
+    const boundaryRegex = new RegExp(`\r?\n--(?:${escapedBoundaries})(?:--)?\r?\n`, 'g');
+    
+    // Split the raw email by any boundary marker found in the email
+    const parts = rawEmail.split(boundaryRegex);
+    // Ignore parts[0] as it is the main outer header block
+    const partsToProcess = parts.slice(1);
+
+    for (const part of partsToProcess) {
+      if (!part.trim()) continue;
+
+      // Each part is separated into part headers and body by a double newline
+      const doubleNewlineIndex = part.search(/\r?\n\r?\n/);
+      if (doubleNewlineIndex === -1) continue;
+
+      const partHeadersText = part.substring(0, doubleNewlineIndex);
+      const partBodyText = part.substring(doubleNewlineIndex).trim();
+
+      // Parse part headers to handle Content-Type and Content-Transfer-Encoding
+      const partHeaders = {};
+      const headerLines = partHeadersText.split(/\r?\n/);
+      let currentHeader = "";
+      for (const line of headerLines) {
+        if (/^\s/.test(line)) {
+          currentHeader += " " + line.trim();
+        } else {
+          if (currentHeader) {
+            const colonIdx = currentHeader.indexOf(":");
+            if (colonIdx !== -1) {
+              const name = currentHeader.substring(0, colonIdx).trim().toLowerCase();
+              const val = currentHeader.substring(colonIdx + 1).trim();
+              partHeaders[name] = val;
+            }
+          }
+          currentHeader = line.trim();
+        }
+      }
+      if (currentHeader) {
+        const colonIdx = currentHeader.indexOf(":");
+        if (colonIdx !== -1) {
+          const name = currentHeader.substring(0, colonIdx).trim().toLowerCase();
+          const val = currentHeader.substring(colonIdx + 1).trim();
+          partHeaders[name] = val;
+        }
+      }
+
+      const contentType = partHeaders["content-type"] || "";
+      const contentTransferEncoding = partHeaders["content-transfer-encoding"] || "";
+      const contentDisposition = partHeaders["content-disposition"] || "";
+
+      // Skip actual file attachments
+      if (contentDisposition.toLowerCase().includes("attachment")) {
+        continue;
+      }
+
+      // Check if it's text or html
+      const isPlain = contentType.toLowerCase().includes("text/plain");
+      const isHtml = contentType.toLowerCase().includes("text/html");
+      if (!isPlain && !isHtml && contentType) {
+        // If content-type is set but it is neither plain nor HTML (e.g. image, octet-stream), skip it
+        continue;
+      }
+
+      let decodedBody = partBodyText;
+      if (contentTransferEncoding.toLowerCase().includes("base64")) {
+        try {
+          const cleanedBase64 = partBodyText.replace(/\s+/g, "");
+          const decoded = atob(cleanedBase64);
+          try {
+            decodedBody = new TextDecoder("utf-8").decode(Uint8Array.from(decoded, c => c.charCodeAt(0)));
+          } catch (e) {
+            decodedBody = decoded;
+          }
+        } catch (e) {
+          console.error("Failed to decode base64 MIME part:", e);
+          continue;
+        }
+      } else if (contentTransferEncoding.toLowerCase().includes("quoted-printable")) {
+        decodedBody = decodeQuotedPrintable(partBodyText);
+      }
+
+      // Collect part bodies up to a generous limit (500KB per part) to keep memory safe
+      if (decodedBody.trim().length > 0 && decodedBody.trim().length < 500000) {
+        if (isHtml) {
+          htmlParts.push(decodedBody.trim());
+        } else {
+          textParts.push(decodedBody.trim());
         }
       }
     }
-
-    text = textBlocks.join("\n\n").trim();
   }
 
-  // Fallback if formatting was simple/flat
-  if (!text) {
-    text = rawEmail.length > 5000 ? rawEmail.substring(0, 5000) + "... (Truncated)" : rawEmail;
+  // Fallback for simple flat emails with no boundaries
+  if (textParts.length === 0 && htmlParts.length === 0) {
+    const doubleNewlineIndex = rawEmail.search(/\r?\n\r?\n/);
+    if (doubleNewlineIndex !== -1) {
+      const mainBody = rawEmail.substring(doubleNewlineIndex).trim();
+      
+      const cteMatch = rawEmail.match(/content-transfer-encoding:\s*([^\s;]+)/i);
+      const cte = cteMatch ? cteMatch[1].toLowerCase() : "";
+      
+      let decodedBody = mainBody;
+      if (cte.includes("quoted-printable")) {
+        decodedBody = decodeQuotedPrintable(mainBody);
+      } else if (cte.includes("base64")) {
+        try {
+          const cleanedBase64 = mainBody.replace(/\s+/g, "");
+          const decoded = atob(cleanedBase64);
+          try {
+            decodedBody = new TextDecoder("utf-8").decode(Uint8Array.from(decoded, c => c.charCodeAt(0)));
+          } catch (e) {
+            decodedBody = decoded;
+          }
+        } catch (e) {}
+      }
+
+      if (rawEmail.toLowerCase().includes("content-type: text/html")) {
+        htmlParts.push(decodedBody);
+      } else {
+        textParts.push(decodedBody);
+      }
+    }
+  }
+
+  // Concatenate parts so they can be isolated by the Android app's isolateParts function
+  if (textParts.length > 0 || htmlParts.length > 0) {
+    const plainCombined = textParts.join("\n\n").trim();
+    const htmlCombined = htmlParts.join("\n\n").trim();
+    
+    if (plainCombined && htmlCombined) {
+      text = plainCombined + "\n\n" + htmlCombined;
+    } else if (htmlCombined) {
+      text = htmlCombined;
+    } else {
+      text = plainCombined;
+    }
+  }
+
+  // Absolute fallback to prevent zero text stored
+  if (!text.trim()) {
+    const doubleNewlineIndex = rawEmail.search(/\r?\n\r?\n/);
+    if (doubleNewlineIndex !== -1) {
+      text = rawEmail.substring(doubleNewlineIndex).trim();
+    } else {
+      text = rawEmail;
+    }
+    if (text.length > 10000) {
+      text = text.substring(0, 10000) + "... (Truncated)";
+    }
   }
 
   return { text, links };
+}
+
+/**
+ * Drastically cleans HTML string to plain text.
+ */
+function stripHtml(html) {
+  let text = html || "";
+  // 1. Remove style blocks completely
+  text = text.replace(/<style\b[^>]*>.*?<\/style>/gs, "");
+  // 2. Remove script blocks completely
+  text = text.replace(/<script\b[^>]*>.*?<\/script>/gs, "");
+  // 3. Remove all HTML tags
+  text = text.replace(/<[^>]+>/g, " ");
+  // 4. Decode HTML entities
+  text = text.replace(/&amp;/g, "&")
+             .replace(/&nbsp;/g, " ")
+             .replace(/&lt;/g, "<")
+             .replace(/&gt;/g, ">")
+             .replace(/&quot;/g, "\"")
+             .replace(/&#39;/g, "'");
+  return text;
+}
+
+/**
+ * Checks if a code is likely styling or formatting noise.
+ */
+function isNoisyOrRepetitive(code) {
+  if (!code) return true;
+  const uniqueChars = new Set(code);
+  if (uniqueChars.size <= 1) return true;
+  
+  if (code.length === 4) {
+    const valInt = parseInt(code, 10);
+    if (!isNaN(valInt) && valInt >= 1900 && valInt <= 2050) {
+      return true;
+    }
+  }
+  if (code.length === 8) {
+    const firstFour = parseInt(code.substring(0, 4), 10);
+    if (!isNaN(firstFour) && firstFour >= 1900 && firstFour <= 2050) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -372,36 +550,3 @@ function extractOtpCode(subject, body) {
 
   return null;
 }
-
-function isNoisyOrRepetitive(code) {
-  if (!code) return true;
-  // Exclude sequential numbers
-  if (code === "1234" || code === "12345" || code === "123456" || code === "1234567" || code === "12345678") {
-    return true;
-  }
-  // Exclude identical repeating digits (e.g. 111111)
-  const firstChar = code[0];
-  let allSame = true;
-  for (let i = 1; i < code.length; i++) {
-    if (code[i] !== firstChar) {
-      allSame = false;
-      break;
-    }
-  }
-  return allSame;
-}
-
-function stripHtml(html) {
-  if (!html) return "";
-  let text = html;
-  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ");
-  text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ");
-  text = text.replace(/<[^>]+>/g, " ");
-  text = text.replace(/&nbsp;/gi, " ");
-  text = text.replace(/&amp;/gi, "&");
-  text = text.replace(/&lt;/gi, "<");
-  text = text.replace(/&gt;/gi, ">");
-  text = text.replace(/&quot;/gi, '"');
-  text = text.replace(/\s+/g, " ");
-  return text.trim();
-  }
